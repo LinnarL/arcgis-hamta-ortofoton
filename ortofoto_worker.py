@@ -2,7 +2,8 @@
 """
 ortofoto_worker.py
 
-Läser block ur Lantmäteriets ortofoton och sätter ihop dem till en GeoTIFF.
+Läser block ur Lantmäteriets raster (ortofoton, markhöjdmodell, topografisk
+webbkarta) och sätter ihop dem till en GeoTIFF.
 Körs i egna processer, startade av HamtaOrtofoton.pyt, och importerar aldrig
 arcpy: GDAL i trådar i samma process som arcpy har gett access violation
 (Esris gdal_e.dll delas), se CLAUDE.md. gdal importeras därför först i main(),
@@ -18,7 +19,12 @@ GDAL:s curl i Pro saknar CA-certifikat, så CA-filen pekas mot certifi.
 Ett pixelvärde 0 betyder NoData i resultatet. Warp skriver en alfakanal som
 visar vilka pixlar som har data; riktiga 0 höjs till 1 och pixlar utan data
 sätts till 0 i alla band, så att en mörk pixel aldrig blir ett hål och ett hål
-aldrig syns som svart.
+aldrig syns som svart. Höjddata är flyttal med egen NoData (FLOAT_NODATA) och
+behöver inte det steget.
+
+Topografisk webbkarta är en enda GeoPackage på 175 GB. Även den läses med
+/vsicurl/: SQLite hämtar bara de sidor som behövs, och kartans zoomnivåer är
+filens översikter.
 """
 
 import json
@@ -29,6 +35,7 @@ import traceback
 
 RESULT_PREFIX = "@@RESULT "
 NODATA = 0
+FLOAT_NODATA = -9999.0
 
 USER_AGENT = "arcgis-hamta-ortofoton/1.0"
 
@@ -36,6 +43,7 @@ _TIFF_BLOCK = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=DEFLAT
                "ZLEVEL=1", "ALPHA=NO"]
 _TIFF_FINAL = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=DEFLATE", "PREDICTOR=2",
                "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS", "ALPHA=NO"]
+_TIFF_FLOAT = [o.replace("PREDICTOR=2", "PREDICTOR=3") for o in _TIFF_FINAL]
 # Översikter byggs tills den minsta sidan är under detta.
 MIN_OVERVIEW_PX = 256
 
@@ -46,7 +54,7 @@ def _configure(gdal):
         "GDAL_CURL_CA_BUNDLE": certifi.where(),
         "CURL_CA_BUNDLE": certifi.where(),
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.gpkg",
         "CPL_VSIL_CURL_CHUNK_SIZE": "524288",
         "GDAL_INGESTED_BYTES_AT_OPEN": "65536",
         "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
@@ -63,6 +71,30 @@ def _configure(gdal):
     for key, value in options.items():
         gdal.SetConfigOption(key, value)
     gdal.UseExceptions()
+
+
+def warp_float(gdal, task):
+    """Ett block med flyttal. Filerna har egen NoData, så ingen alfakanal behövs."""
+    gdal.SetConfigOption("GDAL_HTTP_BEARER", task["token"])
+    options = dict(
+        format="GTiff", outputBounds=task["bounds"], width=task["width"], height=task["height"],
+        dstSRS=task["srs"], resampleAlg=task["resampling"], dstNodata=FLOAT_NODATA,
+        outputType=gdal.GDT_Float32, warpMemoryLimit=256, multithread=False,
+        creationOptions=["TILED=YES", "COMPRESS=DEFLATE", "ZLEVEL=1", "PREDICTOR=3"],
+    )
+    if task.get("cutline"):
+        with open(task["cutline"], encoding="utf-8") as fh:
+            options["cutlineWKT"] = fh.read()
+        options["cutlineSRS"] = task["srs"]
+    gdal.Warp(task["out"], ["/vsicurl/" + s["url"] for s in task["sources"]],
+              options=gdal.WarpOptions(**options))
+    ds = gdal.Open(task["out"])
+    values = ds.GetRasterBand(1).ReadAsArray()
+    ds = None
+    if (values == FLOAT_NODATA).all():
+        gdal.GetDriverByName("GTiff").Delete(task["out"])
+        return {"empty": True}
+    return {"empty": False}
 
 
 def warp_block(gdal, task):
@@ -124,10 +156,12 @@ def assemble(gdal, task):
     """Blocken till en GeoTIFF med översikter, över hela rutnätet."""
     vrt_path = task["out"] + ".vrt"
     x0, y0, x1, y1 = task["bounds"]
+    nodata = FLOAT_NODATA if task.get("float") else NODATA
     vrt = gdal.BuildVRT(vrt_path, task["blocks"], outputBounds=(x0, y0, x1, y1),
-                        xRes=task["cell"], yRes=task["cell"], srcNodata=NODATA, VRTNodata=NODATA)
+                        xRes=task["cell"], yRes=task["cell"], srcNodata=nodata, VRTNodata=nodata)
     vrt = None
-    gdal.Translate(task["out"], vrt_path, format="GTiff", creationOptions=_TIFF_FINAL)
+    gdal.Translate(task["out"], vrt_path, format="GTiff",
+                   creationOptions=_TIFF_FLOAT if task.get("float") else _TIFF_FINAL)
     gdal.Unlink(vrt_path)
 
     for key, value in (("COMPRESS_OVERVIEW", "DEFLATE"), ("PREDICTOR_OVERVIEW", "2"),
@@ -152,7 +186,12 @@ def main():
     for line in sys.stdin:
         task = json.loads(line)
         try:
-            result = warp_block(gdal, task) if task["kind"] == "block" else assemble(gdal, task)
+            if task["kind"] == "assemble":
+                result = assemble(gdal, task)
+            elif task.get("float"):
+                result = warp_float(gdal, task)
+            else:
+                result = warp_block(gdal, task)
             result["ok"] = True
         except Exception as exc:
             traceback.print_exc()

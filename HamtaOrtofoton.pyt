@@ -2,9 +2,10 @@
 """
 HamtaOrtofoton.pyt
 
-Hämtar Lantmäteriets ortofoton för ett område och lägger dem i kartan för
-användning utan uppkoppling. Användaren ser vilka år och bildtyper som täcker
-området och väljer vilka som ska hämtas och med vilken cellstorlek.
+Hämtar Lantmäteriets geodata för ett område och lägger dem i kartan för
+användning utan uppkoppling: ortofoton, markhöjdmodell, topografisk webbkarta
+och vektordata. Användaren ser vad som täcker området och väljer vad som ska
+hämtas och med vilken cellstorlek.
 
 Datakälla
 ---------
@@ -47,6 +48,20 @@ Verktygstips (parameterförklaringar) skrivs till
 HamtaOrtofoton.HamtaOrtofoton.pyt.xml från TOOLTIPS nedan när verktygslådan
 laddas, så att texten bara finns på ett ställe.
 
+Övriga kataloger (samma inloggning, men varje produkt beställs för sig):
+    https://api.lantmateriet.se/stac-hojd/v1    dtm-cog: markhöjdmodell, COG i
+        EPSG:5845 (SWEREF 99 TM + RH 2000), 1 m, flyttal. Läses som ortofotona.
+    https://api.lantmateriet.se/stac-karta/v1   topowebb: en GeoPackage på 175 GB
+        per variant och koordinatsystem. Läses med GDAL, se ortofoto_worker.py.
+    https://api.lantmateriet.se/stac-vektor/v1  zip med GeoPackage per kommun
+        (byggnader, marktäcke, fastighetsindelning, adresser) eller för hela
+        landet (ortnamn, kommun-lan-rike). Laddas ned hela, klipps till området
+        och skrivs som featureklasser. Item "aktuell" i kommun-lan-rike är
+        nuläget, övriga items är äldre år. Lagernamnen läses ur filerna.
+
+NMK 50 och 250 i stac-karta tas inte med: användningsvillkoren gäller offentlig
+slutanvändning inom civil beredskap.
+
 Krav: ArcGIS Pro 3.x. arcpy, numpy, GDAL och certifi ingår i arcgispro-py3.
 Ingen licensnivå utöver Basic behövs.
 """
@@ -68,6 +83,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from xml.sax.saxutils import escape
 
 import arcpy
@@ -84,14 +100,49 @@ importlib.reload(_ow)
 
 STAC_SEARCH_URL = "https://api.lantmateriet.se/stac-bild/v1/search"
 TOKEN_URL = "https://apimanager.lantmateriet.se/oauth2/token"
-PRODUCT_URL = "https://www.lantmateriet.se/sv/geodata/vara-produkter/produktlista/ortofoto-nedladdning/"
-ATTRIBUTION = "Lantmäteriet, Ortofoto Nedladdning"
+STAC_HOJD_URL = "https://api.lantmateriet.se/stac-hojd/v1/search"
+STAC_KARTA_URL = "https://api.lantmateriet.se/stac-karta/v1/search"
+STAC_VEKTOR_URL = "https://api.lantmateriet.se/stac-vektor/v1/search"
+PRODUCT_LIST = "https://www.lantmateriet.se/sv/geodata/vara-produkter/produktlista/"
+PRODUCT_URL = PRODUCT_LIST + "ortofoto-nedladdning/"
+ATTRIBUTION = "Lantmäteriet"
+
+KIND_ORTHO = "ortho"
+KIND_DTM = "dtm"
+KIND_MAP = "map"
+KIND_VECTOR = "vector"
+
+DTM_COLLECTION = "dtm-cog"
+DTM_RES = 1.0
+DTM_URL = PRODUCT_LIST + "markhojdmodell-nedladdning"
+# Item i stac-karta: (rubrik, namn i utdata). Det finns även items i Web Mercator
+# (-3857). Rastret projiceras ändå om vid behov, så SWEREF-filen räcker.
+MAP_ITEMS = {
+    "topowebb-3006": ("Topografisk webbkarta", "topowebb"),
+    "topowebb_nedtonad-3006": ("Topografisk webbkarta nedtonad", "topowebb_nedtonad"),
+}
+MAP_COLLECTION = "topowebb"
+MAP_DEFAULT_CELL = 1.0
+MAP_URL = PRODUCT_LIST + "topografisk-webbkarta-nedladdning-raster"
+# Samling i stac-vektor: rubrik. Filerna täcker en kommun eller hela landet.
+VECTOR_COLLECTIONS = {
+    "byggnader": "Byggnader",
+    "marktacke": "Marktäcke",
+    "fastighetsindelning": "Fastighetsindelning",
+    "belagenhetsadresser": "Belägenhetsadresser",
+    "ortnamn": "Ortnamn",
+    "kommun-lan-rike": "Kommun, län och rike",
+}
+VECTOR_LATEST_ITEM = {"kommun-lan-rike": "aktuell"}
+VECTOR_URL = "https://geotorget.lantmateriet.se/geodataprodukter"
 
 USER_AGENT = _ow.USER_AGENT
 HTTP_TIMEOUT = 60
 HTTP_RETRIES = 3
 # Sökningen i dialogen ska ge upp snabbt, dialogen väntar på den.
 DIALOG_TIMEOUT = 20
+# Fyra kataloger per sökning, och de svarar 429 efter ett tiotal snabba anrop.
+DIALOG_RETRIES = 2
 
 TOKEN_MAX_AGE_S = 50 * 60
 
@@ -109,6 +160,11 @@ MAX_WORKERS = 4
 SIZE_FACTOR = 0.8
 # Blocken och den färdiga filen ligger samtidigt på disken.
 DISK_FACTOR = 2.2
+# Markhöjdmodellens flyttal, från katalogens file:size (246 MB för 10 000 x 10 000).
+DTM_BYTES_PER_CELL = 2.5
+# En uppackad GeoPackage jämfört med zip-filen, uppskattat.
+UNZIP_FACTOR = 5
+DOWNLOAD_CHUNK = 1024 * 1024
 LARGE_GB = 10
 
 # Ytor mindre än så här (m²) räknas inte som täckning.
@@ -146,9 +202,10 @@ LOGIN_NO_KEY = "Ange en consumer key från Lantmäteriets API-portal."
 LOGIN_NO_SECRET = "Ange consumer secret."
 
 TOOL_SUMMARY = (
-    "Hämtar Lantmäteriets ortofoton för ett område till GeoTIFF eller geodatabas och lägger "
-    "dem i kartan, så att de går att använda utan uppkoppling. Visar vilka år och bildtyper "
-    "(färg, IR, svartvit) som täcker området. Bara området hämtas, hela rutor laddas aldrig ned."
+    "Hämtar Lantmäteriets geodata för ett område och lägger dem i kartan, så att de går att "
+    "använda utan uppkoppling: ortofoton (färg, IR, svartvit), markhöjdmodell, topografisk "
+    "webbkarta och vektordata som byggnader och fastighetsindelning. Visar vad som täcker "
+    "området. Raster läses bara för området, vektordata hämtas per kommun och klipps."
 )
 
 # Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
@@ -173,15 +230,24 @@ TOOLTIPS = {
         "koordinatsystem; vilket som användes står i meddelandena."
     ),
     "search": (
-        "Markera för att söka i Lantmäteriets katalog och fylla listan 'Ortofoton att hämta' "
+        "Markera för att söka i Lantmäteriets kataloger och fylla listan 'Data att hämta' "
         "med det som täcker området. Sökningen är öppen, kräver ingen nyckel och tar någon "
         "sekund. Den görs om när området ändras, så länge rutan är markerad. Av som standard, "
         "eftersom dialogen annars skulle anropa Lantmäteriet utan att du bett om det."
     ),
     "selection": (
-        "De ortofoton som ska hämtas. Listan fylls när du markerat 'Sök tillgängliga ortofoton'. "
-        "Varje rad är år, bildtyp, filernas upplösning, hur stor del av området som täcks och "
-        "ungefärlig storlek i filernas upplösning. Varje vald rad blir ett eget raster.\n"
+        "Det som ska hämtas. Listan fylls när du markerat 'Sök tillgängliga data'. Överst står "
+        "höjd, karta och vektordata, sedan ortofoton med nyast först. Varje produkt beställs "
+        "för sig på Geotorget, och nyckeln måste ha behörighet till det du väljer.\n"
+        "Höjd är Lantmäteriets markhöjdmodell, 1 m, flyttal i meter över havet (RH 2000).\n"
+        "Karta är den topografiska webbkartan. Cellstorleken väljer kartans zoomnivå: kartans "
+        "innehåll ändras med skalan, så 1 m är en detaljerad karta och 16 m en översikt. "
+        "Tomt = 1 m.\n"
+        "Vektor är en eller flera GeoPackage som hämtas per kommun, eller för hela landet, och "
+        "klipps till området. Varje lager i filen blir en egen featureklass. Cellstorleken "
+        "gäller inte vektordata.\n"
+        "En ortofotorad är år, bildtyp, filernas upplösning, hur stor del av området som täcks "
+        "och ungefärlig storlek i filernas upplösning. Varje vald rad blir ett eget raster.\n"
         "Färg är röd, grön, blå. IR är färginfraröd i falsk färg (nära infrarött, rött, grönt), "
         "där levande vegetation syns röd. Färg + IR är ett raster med fyra band (röd, grön, "
         "blå, nära infrarött) och finns från 2019. Svartvit är äldre flygbilder.\n"
@@ -190,10 +256,11 @@ TOOLTIPS = {
         "I ett skript anges de tre första fälten, till exempel '2025 | Färg | 0,16 m'."
     ),
     "consumer_key": (
-        "Consumer key från Lantmäteriets API-portal. Nyckeln behöver API:et STAC-bild och en "
-        "beställning av Ortofoto Nedladdning på Geotorget. Produkten är avgiftsfri men "
-        "beställningen prövas och du behöver godkänna särskilda användningsvillkor. Behövs bara "
-        "för att hämta, inte för att söka."
+        "Consumer key från Lantmäteriets API-portal. Nyckeln behöver det API som hör till "
+        "katalogen (STAC-bild, STAC-hojd, STAC-karta, STAC-vektor) och en beställning av varje "
+        "produkt på Geotorget. Produkterna är avgiftsfria, men vissa beställningar prövas och "
+        "du behöver godkänna särskilda användningsvillkor. Behövs bara för att hämta, inte för "
+        "att söka."
     ),
     "consumer_secret": (
         "Consumer secret som hör till nyckeln. Visas dold i dialogen och skrivs aldrig till "
@@ -207,26 +274,29 @@ TOOLTIPS = {
         "för att byta nyckel. Ta bort den under Autentiseringshanteraren, Windows-autentiseringsuppgifter."
     ),
     "out_workspace": (
-        "Geodatabas eller mapp där rastren sparas. I en mapp blir de GeoTIFF. En mapp på samma "
+        "Geodatabas eller mapp där resultatet sparas. I en mapp blir raster GeoTIFF och "
+        "vektordata shapefiler, som kortar fältnamn och text. En mapp på samma "
         "dator går snabbast att visa utan uppkoppling. Undvik mappar som synkas till molnet, som "
         "OneDrive: ortofoton blir snabbt stora."
     ),
     "prefix": (
-        "Början på utdatanamnen: <prefix>_<år>_<bildtyp>, till exempel ortofoto_2025_farg. Finns "
+        "Början på utdatanamnen: <prefix>_<år>_<bildtyp>, till exempel lm_2025_farg, "
+        "lm_markhojd, lm_topowebb, eller <prefix>_<lager> för vektordata. Finns "
         "samma år och bildtyp i flera upplösningar läggs upplösningen till i namnet. Bara "
         "bokstäver, siffror och understreck, och första tecknet måste vara en bokstav. Befintliga "
         "raster skrivs över bara om geobehandlingens inställning för att skriva över utdata är "
         "på."
     ),
     "cell_size": (
-        "Cellstorlek i meter i det hämtade rastret. Tomt = filernas egen upplösning, som kan "
-        "skilja mellan åren: 0,16 eller 0,4 m från 2019, 0,25 eller 0,5 m före. Fördubblad "
+        "Cellstorlek i meter i de hämtade rastren. Tomt = filernas egen upplösning: för ortofoton "
+        "0,16 eller 0,4 m från 2019, 0,25 eller 0,5 m före, för markhöjdmodellen 1 m, för kartan "
+        "1 m. Gäller inte vektordata. Fördubblad "
         "cellstorlek ger en fjärdedel så stor fil. Grövre än originalet hämtar bara filernas "
         "översikter och går snabbare. Finare än originalet ger ingen ny information, bara en "
         "större fil. Ett lokalt värde på Cell Size i miljöinställningarna används om fältet är "
         "tomt. Mellan 0,1 och 100 m."
     ),
-    "out_rasters": "De hämtade rastren.",
+    "out_rasters": "De hämtade rastren och featureklasserna.",
 }
 
 
@@ -396,30 +466,35 @@ class _Token:
         return self.value
 
 
-def _access_error(code):
-    return ("Nyckeln saknar behörighet till ortofotona (HTTP {}). Den behöver API:et STAC-bild i "
-            "Lantmäteriets API-portal och en beställning av Ortofoto Nedladdning:\n{}".format(
-                code, PRODUCT_URL))
+def _access_error(code, group=None):
+    title = group["title"] if group else "ortofotona"
+    return ("Nyckeln saknar behörighet till {} (HTTP {}). Den behöver katalogens API i "
+            "Lantmäteriets API-portal och en beställning av produkten:\n{}".format(
+                title, code, group["product_url"] if group else PRODUCT_URL))
 
 
-def _check_access(url, token):
+def _check_access(group, token):
     """Hämta en byte av första filen, för ett begripligt fel i stället för GDAL:s."""
     req = urllib.request.Request(
-        url, headers={"Authorization": "Bearer " + token, "Range": "bytes=0-0",
-                      "User-Agent": USER_AGENT},
+        group["items"][0]["url"],
+        headers={"Authorization": "Bearer " + token, "Range": "bytes=0-0",
+                 "User-Agent": USER_AGENT},
     )
     try:
         _http(req)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            raise ValueError(_access_error(exc.code))
+            raise ValueError(_access_error(exc.code, group))
         raise
 
 
-def _stac_search(bbox_wgs84, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES):
+def _stac_search(bbox_wgs84, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES, search_url=STAC_SEARCH_URL,
+                 collections=None):
     """Alla items som skär bbox, över alla sidor."""
     body = {"bbox": list(bbox_wgs84), "limit": 1000}
-    url, method = STAC_SEARCH_URL, "POST"
+    if collections:
+        body["collections"] = list(collections)
+    url, method = search_url, "POST"
     items = []
     seen_pages = set()
     while url:
@@ -632,24 +707,114 @@ def _groups(features, aoi):
             continue
         n_bands = len(kept[0]["bands"])
         groups.append({
-            "year": year, "image": image, "res": res, "items": kept, "area": area,
-            "coverage": min(1.0, area / aoi.area),
+            "kind": KIND_ORTHO, "year": year, "image": image, "res": res, "items": kept,
+            "area": area, "coverage": min(1.0, area / aoi.area),
             "bytes": area / (res * res) * n_bands * SIZE_FACTOR,
             "key": _key(year, image, res),
+            "title": "ortofoto {} {}".format(year, image.lower()),
+            "product_url": PRODUCT_URL,
         })
     groups.sort(key=lambda g: (-g["year"], IMG_ORDER.index(g["image"]), g["res"]))
     return groups
 
 
+def _dtm_group(features, aoi):
+    """Markhöjdmodellen, om den täcker något av området."""
+    tm = arcpy.SpatialReference(SWEREF99TM_WKID)
+    items = []
+    for f in features:
+        data = f.get("assets", {}).get("data")
+        if data:
+            items.append({"id": f["id"], "url": data["href"], "bands": [1],
+                          "fp": _footprint(f, tm), "size": data.get("file:size") or 0,
+                          "datetime": f["properties"].get("datetime") or ""})
+    kept, area = _pick_items(items, aoi)
+    if not kept:
+        return None
+    return {"kind": KIND_DTM, "key": SEP.join(("Höjd", "Markhöjdmodell", "1 m")), "res": DTM_RES,
+            "items": kept, "area": area, "coverage": min(1.0, area / aoi.area),
+            "bytes": area / (DTM_RES * DTM_RES) * DTM_BYTES_PER_CELL, "name": "markhojd",
+            "title": "markhöjdmodell", "product_url": DTM_URL}
+
+
+def _map_groups(features, aoi):
+    """Webbkartan: ett item per variant. Filen täcker landet, så täckningen är hela området."""
+    groups = []
+    for f in features:
+        known = MAP_ITEMS.get(f["id"])
+        data = f.get("assets", {}).get("data")
+        if not known or not data:
+            continue
+        title, name = known
+        res = MAP_DEFAULT_CELL
+        groups.append({
+            "kind": KIND_MAP, "key": SEP.join(("Karta", title, "SWEREF 99 TM")), "res": res,
+            "items": [{"id": f["id"], "url": data["href"], "bands": [1, 2, 3], "datetime": "",
+                       "fp": None, "size": 0}],
+            "area": aoi.area, "coverage": 1.0, "bytes": aoi.area / (res * res) * 3 * SIZE_FACTOR,
+            "name": name, "title": title.lower(), "product_url": MAP_URL})
+    return sorted(groups, key=lambda g: g["key"])
+
+
+def _vector_groups(features, aoi):
+    """
+    Vektordata per samling. Kommunernas polygoner i katalogen är grova och kan
+    överlappa, så alla filer som skär området hämtas. Klippningen sorterar bort resten.
+    """
+    tm = arcpy.SpatialReference(SWEREF99TM_WKID)
+    found = {}
+    for f in features:
+        col = f.get("collection")
+        data = f.get("assets", {}).get("data")
+        if col not in VECTOR_COLLECTIONS or not data:
+            continue
+        latest = VECTOR_LATEST_ITEM.get(col)
+        if latest and f["id"] != latest:
+            continue
+        if arcpy.AsShape(f["geometry"]).projectAs(tm).disjoint(aoi):
+            continue
+        found.setdefault(col, []).append({
+            "id": f["id"], "url": data["href"], "size": data.get("file:size") or 0,
+            "title": f["properties"].get("title") or f["id"]})
+    groups = []
+    for col, title in VECTOR_COLLECTIONS.items():
+        items = found.get(col)
+        if items:
+            groups.append({
+                "kind": KIND_VECTOR, "key": SEP.join(("Vektor", title, "klipps till området")),
+                "res": None, "items": items, "area": aoi.area, "coverage": 1.0,
+                "bytes": sum(i["size"] for i in items), "name": col, "title": title.lower(),
+                "product_url": VECTOR_URL})
+    return groups
+
+
 def _label(group):
+    if group["kind"] == KIND_VECTOR:
+        return SEP.join((group["key"], "{} fil(er)".format(len(group["items"])),
+                         "ca {}".format(_fmt_gb(group["bytes"]))))
     return SEP.join((group["key"], "täcker {} %".format(int(round(group["coverage"] * 100))),
                      "ca {}".format(_fmt_gb(group["bytes"]))))
 
 
 def _search_groups(aoi, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES):
+    """Allt som täcker området: höjd, karta och vektor först, sedan ortofoton."""
     wgs = aoi.projectAs(arcpy.SpatialReference(WGS84_WKID)).extent
     bbox = (wgs.XMin, wgs.YMin, wgs.XMax, wgs.YMax)
-    return _groups(_stac_search(bbox, timeout, retries), aoi)
+    groups = []
+    dtm = _dtm_group(_stac_search(bbox, timeout, retries, STAC_HOJD_URL, [DTM_COLLECTION]), aoi)
+    if dtm:
+        groups.append(dtm)
+    groups += _map_groups(_stac_search(bbox, timeout, retries, STAC_KARTA_URL, [MAP_COLLECTION]), aoi)
+    groups += _vector_groups(
+        _stac_search(bbox, timeout, retries, STAC_VEKTOR_URL, list(VECTOR_COLLECTIONS)), aoi)
+    return groups + _groups(_stac_search(bbox, timeout, retries), aoi)
+
+
+def _size_estimate(group, cell):
+    """Ungefärlig storlek på resultatet i byte."""
+    if group["kind"] == KIND_VECTOR:
+        return group["bytes"]
+    return group["bytes"] * (group["res"] / (cell or group["res"])) ** 2
 
 
 def _key_of(value):
@@ -694,11 +859,11 @@ def _dialog_search(p):
                                        _Silent())
             else:
                 aoi = _aoi_geometry(p["aoi"].value, _Silent())
-            groups = _search_groups(aoi, DIALOG_TIMEOUT, 1)
+            groups = _search_groups(aoi, DIALOG_TIMEOUT, DIALOG_RETRIES)
             if groups:
                 _DIALOG_SEARCH[key] = (groups, None)
             else:
-                _DIALOG_SEARCH[key] = ([], "Katalogen har inga ortofoton i området.")
+                _DIALOG_SEARCH[key] = ([], "Katalogerna har inga data i området.")
         except ValueError as exc:
             _DIALOG_SEARCH[key] = ([], str(exc))
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
@@ -870,17 +1035,17 @@ class _WorkerPool:
             log.close()
 
 
-def _reply(pool, i, res):
+def _reply(pool, i, res, group=None):
     """Felet i ett svar från en arbetsprocess som läsbart ValueError."""
     if res is None:
         raise ValueError("En arbetsprocess avslutades oväntat:\n{}".format(pool.log_tail(i)))
     if not res.get("ok"):
         if res.get("http") in (401, 403):
-            raise ValueError(_access_error(res["http"]))
+            raise ValueError(_access_error(res["http"], group))
         raise ValueError("Hämtningen misslyckades: {}".format(res.get("error")))
 
 
-def _fetch_blocks(pool, tasks, token, steps, messages):
+def _fetch_blocks(pool, tasks, token, steps, messages, group=None):
     """Kör uppgifterna över processerna. Returnerar filerna för block med data."""
     total = len(tasks)
     arcpy.SetProgressor("step", "Block 0 av {}".format(total), 0, total, 1)
@@ -903,7 +1068,7 @@ def _fetch_blocks(pool, tasks, token, steps, messages):
         if got is None:
             continue
         i, res = got
-        _reply(pool, i, res)
+        _reply(pool, i, res, group)
         running -= 1
         done += 1
         idle.append(i)
@@ -965,9 +1130,12 @@ def _default_workspace():
 def _out_names(groups):
     """Namndelen per rad. Upplösningen tas med bara om två rader annars skulle krocka."""
     base = {}
-    for g in groups:
-        base.setdefault((g["year"], g["image"]), []).append(g)
     names = {}
+    for g in groups:
+        if g["kind"] == KIND_ORTHO:
+            base.setdefault((g["year"], g["image"]), []).append(g)
+        else:
+            names[g["key"]] = g["name"]
     for (year, image), same in base.items():
         for g in same:
             name = "{}_{}".format(year, IMG_NAME[image])
@@ -1024,22 +1192,168 @@ def _write_output(local, target):
         shutil.copy2(local, target)
 
 
-def _write_raster_metadata(path, group, cell):
+def _write_metadata(path, group, cell):
     md = arcpy.metadata.Metadata(path)
-    dates = sorted({i["datetime"][:10] for i in group["items"] if i["datetime"]})
-    period = dates[0] if len(dates) == 1 else "{} - {}".format(dates[0], dates[-1]) if dates else ""
-    md.title = "Ortofoto {} {}".format(group["year"], group["image"].lower())
-    md.summary = "Lantmäteriets ortofoto, {} {}, hämtat {}.".format(
-        group["year"], group["image"].lower(), datetime.date.today().isoformat())
-    md.description = (
-        "<p>Bildtyp: {}. Filernas upplösning {} m, cellstorlek {} m. Fotodatum: {}.</p>"
-        "<p>Källa: Lantmäteriets katalog stac-bild, {} ruta/rutor: {}.</p>".format(
-            group["image"], _fmt_num(group["res"]), _fmt_num(cell), period,
-            len(group["items"]), ", ".join(i["id"] for i in group["items"])))
-    md.tags = "ortofoto, Lantmäteriet, flygbild"
+    today = datetime.date.today().isoformat()
+    title = group["title"]
+    md.title = title[0].upper() + title[1:]
+    md.summary = "Lantmäteriets {}, hämtat {}.".format(title, today)
+    source = "{} fil(er): {}.".format(len(group["items"]),
+                                      ", ".join(i["id"] for i in group["items"]))
+    if group["kind"] == KIND_ORTHO:
+        dates = sorted({i["datetime"][:10] for i in group["items"] if i["datetime"]})
+        period = dates[0] if len(dates) == 1 else "{} - {}".format(dates[0], dates[-1]) if dates else ""
+        md.description = (
+            "<p>Bildtyp: {}. Filernas upplösning {} m, cellstorlek {} m. Fotodatum: {}.</p>"
+            "<p>Källa: {}</p>".format(group["image"], _fmt_num(group["res"]), _fmt_num(cell),
+                                      period, source))
+    else:
+        md.description = "<p>Källa: {}</p>".format(source)
+    md.tags = "Lantmäteriet, {}".format(title)
     md.credits = "Källa: {}".format(ATTRIBUTION)
-    md.accessConstraints = "Användningsvillkor för Ortofoto Nedladdning: {}".format(PRODUCT_URL)
+    md.accessConstraints = "Användningsvillkor: {}".format(group["product_url"])
     md.save()
+
+
+def _download(url, target, token, label, messages):
+    """
+    En fil till disken. Avbrott fortsätter med Range från .part-filen, och storleken
+    kontrolleras mot svaret. Omförsök med stigande väntan vid tillfälliga fel.
+    """
+    part = target + ".part"
+    total = None
+    delay = 2
+    for attempt in range(HTTP_RETRIES + 2):
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        headers = {"Authorization": "Bearer " + token, "User-Agent": USER_AGENT}
+        if have:
+            headers["Range"] = "bytes={}-".format(have)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                        timeout=HTTP_TIMEOUT) as resp:
+                # Utan 206 skickar servern hela filen: börja om.
+                mode = "ab" if have and resp.status == 206 else "wb"
+                if mode == "wb":
+                    have = 0
+                length = resp.headers.get("Content-Length")
+                total = have + int(length) if length else None
+                with open(part, mode) as fh:
+                    while True:
+                        chunk = resp.read(DOWNLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        have += len(chunk)
+                        if total:
+                            arcpy.SetProgressorLabel("{}: {} av {}".format(
+                                label, _fmt_gb(have), _fmt_gb(total)))
+                        if getattr(arcpy.env, "isCancelled", False):
+                            raise ValueError("Avbrutet.")
+            if total is None or os.path.getsize(part) == total:
+                os.replace(part, target)
+                return
+            raise OSError("ofullständig fil")
+        except urllib.error.HTTPError as exc:
+            if not (exc.code in (408, 429) or exc.code >= 500):
+                raise
+            if attempt == HTTP_RETRIES + 1:
+                raise
+        except (urllib.error.URLError, OSError):
+            if attempt == HTTP_RETRIES + 1:
+                raise
+        messages.addMessage("    Nytt försök om {} s.".format(delay))
+        time.sleep(delay)
+        delay *= 2
+
+
+def _gpkg_layers(path):
+    """(namn utan main., sökväg) för featureklasser i en GeoPackage."""
+    layers = []
+    for dirpath, _dirs, names in arcpy.da.Walk(path, datatype="FeatureClass"):
+        for name in names:
+            layers.append((name.split(".")[-1], os.path.join(dirpath, name)))
+    return layers
+
+
+def _fetch_vector(group, aoi, workspace, prefix, token, workdir, messages):
+    """
+    Hämta filerna, klipp varje lager till området och skriv ett lager per
+    featureklass. Mellanled i memory (lokalt, lämnar inget efter sig), resultatet
+    skrivs med en ExportFeatures, så att även en geodatabas på filservern går fort.
+    """
+    is_gdb = str(workspace).lower().endswith(".gdb")
+    pieces = {}
+    temp = []
+    extracted = []
+    try:
+        for n, item in enumerate(group["items"], 1):
+            label = "{}, fil {} av {}".format(group["title"], n, len(group["items"]))
+            arcpy.SetProgressorLabel(label)
+            messages.addMessage("    {}: {} ({})".format(label, item["title"],
+                                                         _fmt_gb(item["size"])))
+            folder = os.path.join(workdir, "{}_{}".format(group["name"], n))
+            os.makedirs(folder, exist_ok=True)
+            archive = os.path.join(folder, "data.zip")
+            try:
+                _download(item["url"], archive, token, label, messages)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    raise ValueError(_access_error(exc.code, group))
+                raise
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(folder)
+            os.remove(archive)
+            gpkgs = [os.path.join(d, f) for d, _s, fs in os.walk(folder) for f in fs
+                     if f.lower().endswith(".gpkg")]
+            if not gpkgs:
+                raise ValueError("{} innehöll ingen GeoPackage.".format(item["id"]))
+            extracted += gpkgs
+            for gpkg in gpkgs:
+                for layer, path in _gpkg_layers(gpkg):
+                    clipped = "memory/klipp_{}".format(uuid.uuid4().hex[:12])
+                    arcpy.analysis.PairwiseClip(path, aoi, clipped)
+                    temp.append(clipped)
+                    if int(arcpy.management.GetCount(clipped)[0]):
+                        pieces.setdefault(layer, []).append(clipped)
+        if not pieces:
+            messages.addWarningMessage("{} har inga objekt i området.".format(group["title"]))
+            return []
+
+        outputs = []
+        for layer, fcs in sorted(pieces.items()):
+            name = arcpy.ValidateTableName("{}_{}".format(prefix, layer), workspace)
+            target = os.path.join(workspace, name if is_gdb else name + ".shp")
+            if arcpy.Exists(target) and not arcpy.env.overwriteOutput:
+                raise ValueError("Finns redan: {}.".format(target))
+            source = fcs[0]
+            if len(fcs) > 1:
+                source = "memory/samlat_{}".format(uuid.uuid4().hex[:12])
+                arcpy.management.Merge(fcs, source)
+                temp.append(source)
+            if arcpy.Exists(target):
+                _release_from_maps([target], messages)
+            with arcpy.EnvManager(extent="MAXOF"):
+                if is_gdb:
+                    arcpy.conversion.ExportFeatures(source, target)
+                else:
+                    # GeoPackage ger 64-bitars ObjectID, som ExportFeatures inte kan
+                    # skriva till en shapefile (ERROR 002809).
+                    arcpy.management.CopyFeatures(source, target)
+            messages.addMessage("    {}: {} objekt.".format(
+                os.path.basename(target), arcpy.management.GetCount(target)[0]))
+            outputs.append(target)
+        return outputs
+    finally:
+        for fc in temp:
+            try:
+                arcpy.management.Delete(fc)
+            except Exception:
+                pass
+        for gpkg in extracted:
+            try:
+                arcpy.management.ClearWorkspaceCache(gpkg)
+            except Exception:
+                pass
 
 
 def _add_to_map(paths, messages):
@@ -1114,7 +1428,7 @@ def _write_tool_metadata(tool_cls, toolbox_alias):
 
 class Toolbox:
     def __init__(self):
-        self.label = "Lantmäteriet: hämta ortofoton"
+        self.label = "Lantmäteriet: hämta geodata"
         self.alias = "hamta_ortofoton"
         self.tools = [HamtaOrtofoton]
         _write_tool_metadata(HamtaOrtofoton, self.alias)
@@ -1122,10 +1436,10 @@ class Toolbox:
 
 class HamtaOrtofoton:
     def __init__(self):
-        self.label = "Hämta ortofoton"
+        self.label = "Hämta geodata"
         self.description = TOOL_SUMMARY + (
             " Kräver en consumer key och secret från Lantmäteriets API-portal med behörighet "
-            "till STAC-bild och Ortofoto Nedladdning."
+            "till katalogerna och de produkter som hämtas."
         )
         self.canRunInBackground = False
 
@@ -1153,13 +1467,13 @@ class HamtaOrtofoton:
         p_extent.enabled = False
 
         p_search = arcpy.Parameter(
-            displayName="Sök tillgängliga ortofoton", name="search", datatype="GPBoolean",
+            displayName="Sök tillgängliga data", name="search", datatype="GPBoolean",
             parameterType="Optional", direction="Input",
         )
         p_search.value = False
 
         p_sel = arcpy.Parameter(
-            displayName="Ortofoton att hämta", name="selection", datatype="GPString",
+            displayName="Data att hämta", name="selection", datatype="GPString",
             parameterType="Required", direction="Input", multiValue=True,
         )
 
@@ -1175,7 +1489,7 @@ class HamtaOrtofoton:
             displayName="Namnprefix", name="prefix", datatype="GPString",
             parameterType="Required", direction="Input",
         )
-        p_prefix.value = "ortofoto"
+        p_prefix.value = "lm"
 
         p_cell = arcpy.Parameter(
             displayName="Cellstorlek (m)", name="cell_size", datatype="GPDouble",
@@ -1199,7 +1513,7 @@ class HamtaOrtofoton:
         p_save.value = False
 
         p_out = arcpy.Parameter(
-            displayName="Hämtade raster", name="out_rasters", datatype="DERasterDataset",
+            displayName="Hämtade data", name="out_rasters", datatype="DEDatasetType",
             parameterType="Derived", direction="Output", multiValue=True,
         )
 
@@ -1275,11 +1589,12 @@ class HamtaOrtofoton:
         notes = []
         if partial:
             notes.append("Täcker bara en del av området: {}.".format(", ".join(partial)))
-        coarse = [g["key"] for g in chosen if cell and cell < g["res"] * 0.999]
+        coarse = [g["key"] for g in chosen
+                  if cell and g["kind"] in (KIND_ORTHO, KIND_DTM) and cell < g["res"] * 0.999]
         if coarse:
             notes.append("Cellstorleken är finare än filerna och ger ingen ny information: "
                          "{}.".format(", ".join(coarse)))
-        total = sum(g["bytes"] * (g["res"] / cell) ** 2 if cell else g["bytes"] for g in chosen)
+        total = sum(_size_estimate(g, cell) for g in chosen)
         if total > LARGE_GB * 1e9:
             notes.append("Det blir ungefär {}. En större cellstorlek ger mindre filer.".format(
                 _fmt_gb(total)))
@@ -1288,7 +1603,8 @@ class HamtaOrtofoton:
 
         if prefix and ws and chosen:
             names = _out_names(chosen)
-            existing = [_out_path(ws, prefix, names[g["key"]]) for g in chosen]
+            existing = [_out_path(ws, prefix, names[g["key"]]) for g in chosen
+                        if g["kind"] != KIND_VECTOR]
             existing = [os.path.basename(e) for e in existing if arcpy.Exists(e)]
             if existing and arcpy.env.overwriteOutput:
                 p["prefix"].setWarningMessage("Skrivs över: " + ", ".join(existing))
@@ -1352,23 +1668,23 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
     """
     chosen = list(dict.fromkeys(_key_of(v) for v in selection))
     if not chosen:
-        raise ValueError("Välj minst ett ortofoto att hämta.")
+        raise ValueError("Välj minst en rad att hämta.")
 
     steps = _Steps(2 + len(chosen) + 1, messages)
     workdir = None
     pool = None
     outputs = []
     try:
-        steps.next("Söker i Lantmäteriets katalog")
+        steps.next("Söker i Lantmäteriets kataloger")
         groups = {g["key"]: g for g in _search_groups(aoi)}
         missing = [k for k in chosen if k not in groups]
         if missing:
             raise ValueError("Finns inte i området: {}.\nTillgängligt:\n{}".format(
                 ", ".join(missing), "\n".join(_label(g) for g in groups.values())
-                or "inga ortofoton"))
+                or "inga data"))
         chosen = [groups[k] for k in chosen]
         for g in chosen:
-            messages.addMessage("    {}, {} ruta/rutor".format(_label(g), len(g["items"])))
+            messages.addMessage("    " + _label(g))
             if g["coverage"] < FULL_COVERAGE:
                 messages.addWarningMessage(
                     "{} täcker {} % av området. Resten blir NoData.".format(
@@ -1376,7 +1692,8 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
         steps.done()
 
         names = _out_names(chosen)
-        targets = {g["key"]: _out_path(workspace, prefix, names[g["key"]]) for g in chosen}
+        targets = {g["key"]: _out_path(workspace, prefix, names[g["key"]]) for g in chosen
+                   if g["kind"] != KIND_VECTOR}
         existing = [t for t in targets.values() if arcpy.Exists(t)]
         if existing and not arcpy.env.overwriteOutput:
             raise ValueError("Finns redan: {}. Slå på att skriva över utdata eller byt "
@@ -1393,11 +1710,14 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
 
         steps.next("Kontrollerar nyckeln")
         token = _Token(key, secret)
-        _check_access(chosen[0]["items"][0]["url"], token.get())
+        # Varje produkt beställs för sig: stoppa innan något hämtas.
+        for g in {g["product_url"] + g["key"].split(SEP)[1]: g for g in chosen}.values():
+            _check_access(g, token.get())
         steps.done()
 
         workdir = tempfile.mkdtemp(prefix="ortofoto_", dir=_local_scratch_folder(messages))
-        need = sum(g["bytes"] * (g["res"] / (cell or g["res"])) ** 2 for g in chosen) * DISK_FACTOR
+        need = sum(_size_estimate(g, cell) * (UNZIP_FACTOR if g["kind"] == KIND_VECTOR else 1)
+                   for g in chosen) * DISK_FACTOR
         free = shutil.disk_usage(workdir).free
         if need > free:
             raise ValueError("För lite ledigt diskutrymme i {}: behöver ungefär {}, ledigt {}. "
@@ -1412,26 +1732,45 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
         pool = _WorkerPool(MAX_WORKERS, workdir)
         for g in chosen:
             steps.next("Hämtar {}".format(g["key"]))
+            if g["kind"] == KIND_VECTOR:
+                clip_geom = aoi if clip else _rect_polygon(
+                    aoi.extent.XMin, aoi.extent.YMin, aoi.extent.XMax, aoi.extent.YMax,
+                    aoi.spatialReference)
+                written = _fetch_vector(g, clip_geom, workspace, prefix, token.get(), workdir,
+                                        messages)
+                for path in written:
+                    try:
+                        _write_metadata(path, g, None)
+                    except Exception as exc:
+                        messages.addWarningMessage("Metadata kunde inte skrivas: {}".format(exc))
+                outputs += written
+                steps.done("{} lager".format(len(written)))
+                continue
             g_cell = cell or g["res"]
+            is_float = g["kind"] == KIND_DTM
             grid = _grid(aoi_out, g_cell, origin)
             messages.addMessage("    {} x {} pixlar, cellstorlek {} m.".format(
                 grid["nx"], grid["ny"], _fmt_num(g_cell)))
-            footprints = [(i, i["fp"] if same_crs else i["fp"].projectAs(sr)) for i in g["items"]]
-            method = _resampling(g_cell, g["res"], same_crs)
+            footprints = [(i, None if i["fp"] is None else i["fp"] if same_crs
+                           else i["fp"].projectAs(sr)) for i in g["items"]]
+            method = "bilinear" if g["kind"] == KIND_MAP else _resampling(g_cell, g["res"], same_crs)
+            if is_float and method == "cubic":
+                method = "bilinear"
 
             tasks = []
             for blk in _blocks(grid, aoi_out, clip):
                 sources = [{"url": i["url"], "bands": i["bands"]} for i, fp in footprints
-                           if not fp.disjoint(blk["rect"])]
+                           if fp is None or not fp.disjoint(blk["rect"])]
                 if not sources:
                     continue
                 tasks.append({
                     "kind": "block", "id": len(tasks), "sources": sources,
                     "bounds": blk["bounds"], "width": blk["width"], "height": blk["height"],
                     "srs": _srs_text(sr), "resampling": method, "cutline": cutline,
+                    "float": is_float,
                     "out": os.path.join(workdir, "{}_{}.tif".format(names[g["key"]], len(tasks))),
                 })
-            files = _fetch_blocks(pool, tasks, token, steps, messages)
+            files = _fetch_blocks(pool, tasks, token, steps, messages, g)
             if not files:
                 raise ValueError("{} gav ingen bild i området.".format(g["key"]))
 
@@ -1440,6 +1779,7 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
             messages.addMessage("    Sätter ihop {} block och bygger översikter.".format(len(files)))
             local = os.path.join(workdir, names[g["key"]] + ".tif")
             pool.submit(0, {"kind": "assemble", "blocks": files, "out": local, "cell": g_cell,
+                            "float": is_float,
                             "bounds": [grid["x0"], grid["y0"], grid["x0"] + grid["nx"] * g_cell,
                                        grid["y0"] + grid["ny"] * g_cell]})
             while True:
@@ -1448,7 +1788,7 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
                     break
                 if getattr(arcpy.env, "isCancelled", False):
                     raise ValueError("Avbrutet.")
-            _reply(pool, *got)
+            _reply(pool, got[0], got[1], g)
             for f in files:
                 os.remove(f)
 
@@ -1459,7 +1799,7 @@ def _run(aoi, clip, selection, workspace, prefix, cell, key, secret, messages):
                 _release_from_maps([targets[g["key"]]], messages)
             _write_output(local, targets[g["key"]])
             try:
-                _write_raster_metadata(targets[g["key"]], g, g_cell)
+                _write_metadata(targets[g["key"]], g, g_cell)
             except Exception as exc:
                 messages.addWarningMessage("Metadata kunde inte skrivas: {}".format(exc))
             os.remove(local)
