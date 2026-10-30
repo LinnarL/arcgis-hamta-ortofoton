@@ -28,7 +28,9 @@ landet. Varje item är en ruta med en COG (asset "data"):
 
 Äldre filer kan ligga i RT 90 (EPSG:3021), övriga i SWEREF 99 TM. En fil per
 bildtyp före 2019, en fil med fyra band därefter, så IR ur en rgbi-fil är
-banden 4, 1, 2.
+banden 4, 1, 2. Bandordningen i rgbi är kontrollerad på en riktig körning (2025,
+Värmdö): röda bilar syns röda, vegetation lyser i band 4. Övriga spektraltyper
+är inte kontrollerade på riktiga filer.
 
 Filerna kräver OAuth2 (client credentials):
     POST https://apimanager.lantmateriet.se/oauth2/token
