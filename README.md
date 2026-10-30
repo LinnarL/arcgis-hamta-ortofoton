@@ -48,6 +48,7 @@ For a 16 ha area over two tiles, 0.16 m read about 49 MB, 2 m about 4 MB.
 | Namnprefix | `ortofoto` | Output names are `<prefix>_<year>_<type>`, with the resolution added if the same year and type exist in two resolutions |
 | Cellstorlek (m) | files' own | 0.1 to 100 m. Coarser than the files reads only their overviews; finer adds no information |
 | Consumer key / secret | - | Under Inloggning. The secret is a hidden field |
+| Spara nyckeln på den här datorn | off | Under Inloggning. Saves the key and secret in Windows Credential Manager, once Lantmäteriet has accepted them. After that both fields can stay empty, and the same entry is used by all toolboxes here that take this key. To remove it: Credential Manager, Windows Credentials |
 
 The tool honours Output Coordinate System (default SWEREF 99 TM), Cell Size when it is a number,
 Snap Raster when it has the output's coordinate system, Scratch Workspace and overwrite output.
